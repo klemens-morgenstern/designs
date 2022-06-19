@@ -1,0 +1,111 @@
+
+
+## Design document for boost.request
+
+The goal of this library is to provide an easy way for users to send http requests.
+It should be as simple as this:
+
+```cpp
+int main(int argc, char * argv[])
+{
+    using namespace boost;
+    auto res = requests::get<beast::http::string_body>(
+        "https://boost.org/index.html",
+        modifiers(accept("text/html")),
+        options{.follow_redirects = true}));
+
+    std::cout << res.body() << std::endl;
+    return 0;
+}
+```
+
+Alternatively, the an async api should be provided and defaulted to futures as well:
+
+```cpp
+int main(int argc, char * argv[])
+{
+    using namespace boost;
+    auto doc_future = requests::async_get<beast::http::file_body>(
+        "https://boostorg.jfrog.io/artifactory/main/release/1.79.0/source/boost_1_79_0.tar.gz",
+        modifiers(accept("text/html"),
+        file("./boost_1_79.tar.gz")),
+        options{.follow_redirects = true});
+
+    std::cout << index_future.get() << std::endl;
+    doc_future.get();;
+    return 0;
+}
+```
+
+NOTE: It might be preferable to not use a body but a type, i.e. `std::string` in this case.
+
+
+## Connections
+
+At the core are http_connection and https_connections, which shall manage their own connection, and be secured by a semaphore, mutex or channel to allow concurrent calls to async_*.
+
+Similar to every other class they shall offer the following functions:
+
+ - request<T = beast::http::string_body>(http::method, urls::string_view target, RequestBody &&, modifiers<Ts...>, options) -> beast::http::response<T>;
+
+For each http method there shall be an overload taking the expected body type into account:
+
+ - get<T = beast::http::string_body>(urls::string_view target, modifiers<Ts...>, options) -> beast::http::response<T>;
+ - head(urls::string_view target, modifiers<Ts...>, options) -> beast::http::response< boost::http::empty_body >;
+
+And so on.
+
+The request body type shall be deduced by type_trait form the passed RequestBody type.
+A string leads to a string_body, a std::filesystem::path to a file_body. The empty body shall be denoted by a special `empty` type.
+
+Additionally it shall be possible to connect the http connection to a host like so:
+
+ - connect_to_host(urls::string_view host, urls::string_view service) -> void;
+
+Furthermore it shall be possible to upgrade a connection to a websocket.
+ - upgrade(urls::string_view target, modifiers<Ts...>, options) && -> websocket::stream;
+
+All of those functions shall be available as async_* as well.
+
+Furthermore a connection must have a member allowing the inspection of ongoing reads and writes so a pool can choose which connection to use.
+
+### Modifiers and options
+
+The reason modifiers are used is so it is an open set. A modifier shall get called and passed a non const reference to the request before sending it, and with a const response after receiving it. This will allow implementation of features like a cookie jar.
+Option modify the behaviour and not only the request, such as following redirect, or retrying when the request failed in certain case (e.g. retry-later).
+
+### connection_pool
+The connection shall be manageable by a connection_pool, which creates connections as needed up to a set limit. It shall have the same functions as the connections and work on one host for one protocol (that is http://boost.org can't use https://boost.org).
+A connection pool is allowed to connect to different endpoints for the same DNS name.
+A upgraded connection shall be removed from the connection_pool and not count towards it's limit.
+
+A connection pool must recreate closed connection when a request failed because the connection was dropped.
+
+### session
+A session is a map of pools, grouped by (host, port, service [http or https]). It shall have the same functions as the connection, but not take a string_view for the target, but a full urls::url_view to refer to a host and target. The session internally manages the connections and state.
+
+### session_service
+
+In order to allow session less HTTP requests, there shall be a service on a given execution_context, that contains a session, and cleans it up on shutdown.
+
+This will allow async_request to be executed on an explicit execution context, like so:
+
+```cpp
+int main(int argc, char * argv[])
+{
+    using namespace boost;
+    asio::io_context ctx;
+auto res_fut = requests::async_get<beast::http::string_body>(ctx,
+"https://boost.org/index.html",
+modifiers(accept("text/html")),
+options{.follow_redirects = true}));
+
+    ctx.run();
+    std::cout << res.get().body() << std::endl;
+return 0;
+}
+```
+or on the execution context of the completion token. Unless specifier otherwise the default is `use_future`.  If no context is specified this will default to the `system_executor` allowing users to execute async queries without explicit management of any io context.
+
+For that reason, all of the code needs to be thread-safe; it might furthermore be desirable to have a connection object send anothe request while it is reading the answer of the last. 
+

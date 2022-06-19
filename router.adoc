@@ -1,0 +1,33 @@
+(Ramblings)
+
+As nice as routers & dynamic frameworks are, they're to restrictive for us C++ nutjobs.
+
+_It is possible to virtualize a async-op with completion token based on a double dispatch_
+
+
+
+
+[source,cpp]
+----
+template<typename CompletionToken = PolymorphicToken>
+struct basic_router;
+
+
+
+basic_router<asio::use_awaitable_t<>> brr;
+
+// the CT string might be bullshit, but why not?
+
+brr.get<"/test-endpoint/{some-var}">(
+//       ^ C++20 nonsense, not necessary, but nice
+    [](const http::request & rq, const something & map, auto && token /* <- SOME completion handler */)
+    {
+        return my_server.async_handle_request(rq, get<"some-var">(map), token);
+    });
+
+
+// this then allows us to call it:
+http::request req;
+co_await async_read_some(req ,  ..., asio::use_awaitable);
+co_await brr(req, asio::use_awaitable);
+----

@@ -1,0 +1,221 @@
+boost.cbor
+==========
+incomplete draft
+
+
+CBOR can represent a strict superset of JSON that is extended by a type for binary data (binary string according to RFC7049)
+and the option of adding tags to add some type information. 
+
+This library concept shall strive to treat cbor as a superset and make it as compatible as possible to boost.json.
+
+Serialization is not enough
+---------------------------
+
+While it is true, that a `json::value` can be serialized to cbor, all this will do is reduce the json noise, i.e. it's control semantics.
+
+I.e., a string, e.g. `test-string` is `"test-string"` as json and `ktest-string` as cbor, saving us exactly one byte. 
+
+If CBOR is to be used to actually reduce the data size, it will not be enough to just serialize json to cbor, but one has to modify the way
+the cbor data is built. Consider this enum:
+
+[source,cpp]
+----
+enum order_status
+{
+    pending = 1,
+    open    = 2, 
+    closed  = 3,
+    rejected = 4
+};
+----
+
+For serialization to json, one would attempt not only portability, but readability, thus it would probably be serialize as such:
+
+[source,cpp]
+----
+void tag_invoke(json::value_from, json::value & v, const order_status st)
+{
+    switch (st)
+    {
+        case pending:  v = "pending"; break;
+        case open:     v = "open"; break;
+        case closed:   v = "closed"; break;
+        case rejected: v = "rejected"; break;
+    }
+};
+----
+
+While very readable and compatible with cbor, the following binary serialization makes a lot more sense for cbor:
+
+[source,cpp]
+----
+void tag_invoke(cbor::value_from, cbor::value & v, const order_status st)
+{
+    v = std::to_underlying(st);
+};
+----
+
+This would reduce the payload to exactly one byte. 
+
+NOTE: CBOR tag_invoke will extend the hierarchy of tag_invoke calls, i.e. cbor::value_from / cbor::value_to will 
+use json's tag_invoke if no cbor tag_invoke can be found.
+
+Deserialization would get a bit more complex:
+
+
+[source,cpp]
+----
+order_status tag_invoke(json::value_to<order_status>, const json::value & v)
+{
+    if      (v == "pending" )  return pending;
+    else if (v == "open" )     return open;
+    else if (v == "closed" )   return closed;
+    else if (v == "rejected" ) return rejected;    
+    else throw "get wrecked";
+};
+
+order_status tag_invoke(cbor::value_to<order_status>, const cbor::value & v)
+{
+    if (v.kind() == cbor::value::string)
+        return json::value_to<order_status>(v.as_json());
+    else
+        return static_cast<order_status>(cbor::value_to<std::underlying_type_t<order_status>>(v));
+};
+----
+
+
+cbor::byte_string
+-----------------
+
+New type :
+
+
+[source, cpp]
+----
+struct byte_string
+{
+    using value_type  = std::byte; // or similar, so it can't be default-ctor from a string literal by accident.
+
+    /// make it compatible to the 
+    json::storage_ptr ptr_;
+    detail::byte_string_impl impl_;
+    tag_type tag_; // tag that 
+
+
+    byte_string(string_view value, tag encoding); // e.g. byte_string("a3Vyd2E=", base64url)
+
+
+    ///... all the byte string stuff, make it look & feel like a span
+
+    /// return a string converted according to the tag; default is base64url (https://datatracker.ietf.org/doc/html/rfc7049#section-4.1)
+    operator json::string() const ;
+
+};
+----
+
+NOTE: The decoder doesn't need to understnad tags by spec, so we'll ignore string tags for now.
+
+cbor::kind
+----------
+
+-> compatible with json
+
+[source, cpp]
+----
+enum class kind : typename std::underlying_type<json::kind>::type
+{
+    /// The null value.
+    null = static_cast<typename std::underlying_type<json::kind>::type>(json::kind::null),
+
+    /// A `bool`.
+    bool_ = static_cast<typename std::underlying_type<json::kind>::type>(json::kind::bool_),
+
+    /// A `std::int64_t`
+    int64 = static_cast<typename std::underlying_type<json::kind>::type>(json::kind::int64),
+
+    /// A `std::uint64_t`
+    uint64 = static_cast<typename std::underlying_type<json::kind>::type>(json::kind::uint64),
+
+    /// A `double`.
+    double_ = static_cast<typename std::underlying_type<json::kind>::type>(json::kind::double_),
+
+    /// A @ref string.
+    string = static_cast<typename std::underlying_type<json::kind>::type>(json::kind::string),
+
+    /// An @ref array that is entirely json.
+    json_array = static_cast<typename std::underlying_type<json::kind>::type>(json::kind::array),
+
+    /// An @ref object that is entirely json.
+    json_object = static_cast<typename std::underlying_type<json::kind>::type>(json::kind::null),
+
+    /// @ref binary data.
+    binary_string,
+    /// @ref A cbor object
+    object,
+    /// @ref A cbor array
+    array
+    /// Potentially string if prev session is added
+};
+----
+
+cbor::value
+-----------
+
+Basic idea:
+
+[source, cpp]
+----
+struct value
+{
+    union
+    {
+        storage_ptr sp_; // must come first
+        json::value val_; // compatible with all of it
+        array       arr_; 
+        object      obj_;
+        byte_string byt_;
+    };
+
+    // all the value stuff
+
+    cbor::kind kind() const { return static_cast<cbor::kind>(val_.kind()); }
+
+    json::value & if_value()
+    {
+        if (kind() <+ cbor::json_object)
+            return &val_;
+        else
+            return nullptr;
+    }
+
+    operator json::value() const; // implicit conversion
+};
+----
+
+`value_ref` work for cbor as is, we don't have a std way to define a bin array.
+
+
+cbor::array
+-----------
+
+In theory we could just use the same type and cast, but that'll probably be UB for _some_ reason.
+
+The array should just copy whatever json::array is doing. 
+
+Thus:
+
+[source, cpp]
+----
+struct array
+{
+    operator json::array() const; // just convert it.
+};
+----
+
+
+parser/serializer
+-----------------
+
+cbor::serializer etc. similar to json, BUT cbro can be self-described (https://datatracker.ietf.org/doc/html/rfc7049#section-2.4.5).
+
+Thus we should have a `generic_parser` that can parse both json & cbor.
